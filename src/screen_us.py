@@ -158,6 +158,22 @@ def select_mix(leader, peak, lead, budget):
     return selected
 
 
+def select_sequential(region, candidates, budget):
+    training_events = np.flatnonzero(keys.region.ne(region))
+    scores = pred[training_events].copy()
+    remaining = set(candidates)
+    selected = []
+    for _ in range(budget):
+        votes = np.bincount(scores.argmax(axis=1).ravel(), minlength=n)
+        # The candidate indices follow lexical order of connectivity identifiers.
+        chemical = min(remaining, key=lambda j: (-votes[j], j))
+        selected.append((chemical, int(votes[chemical])))
+        remaining.remove(chemical)
+        # Reveal only the selected toxicity and never use held-out events to rank tests.
+        scores[:, chemical, :] = ref[training_events, chemical, None]
+    return selected
+
+
 evaluators = {r: Evaluate(np.flatnonzero(keys.region.eq(r))) for r in regions}
 baseline = np.zeros(N, dtype=bool)
 before_high = np.zeros(N, dtype=bool)
@@ -168,6 +184,8 @@ selected_by_region = {}
 rankings = {}
 details = []
 cumulative = []
+five_test_outcomes = []
+sequential_tests = []
 counter = {
     name: np.zeros(N, dtype=bool)
     for name in ("correct_organophosphorus", "correct_other")
@@ -186,6 +204,26 @@ for region in regions:
     chosen = select_mix(leader, peak, 3, 5)
     after[ev.ix] = strategies["3+2"][ev.ix]
     selected_by_region[region] = [pool[j] for j in chosen]
+    sequence = select_sequential(region, avail, 5)
+    for step, (chemical, votes) in enumerate(sequence, start=1):
+        sequential_tests.append(
+            {"region": region, "test": step, "conn": pool[chemical], "chemical": names[chemical],
+             "leader_votes": votes, "selection_candidates": len(avail)}
+        )
+    comparisons = {
+        "Predictions only": [],
+        "Fixed frequency and peak": chosen,
+        "Fixed frequency only": leader[:5],
+        "Sequential frequency": [chemical for chemical, _ in sequence],
+    }
+    for name, selection in comparisons.items():
+        loss, miss, winner = ev(selection)
+        correct = (ev.r[ev.ar, winner] == ev.target[:, None]).sum(axis=1) >= 5
+        five_test_outcomes.append(
+            {"region": region, "strategy": name, "events": ev.k,
+             "large_ranking_error": int(loss.sum()),
+             "highest_scoring_chemical": int(correct.sum()), "high_score_miss": int(miss.sum())}
+        )
     for name, sel in [
         ("correct_organophosphorus", np.flatnonzero(op)),
         ("correct_other", np.flatnonzero(~op)),
@@ -239,6 +277,11 @@ event["any_OP_detected"] = present[:, op].any(axis=1)
 event.to_csv(OUT / "region_event_comparisons.csv.gz", index=False, compression="gzip")
 pd.DataFrame(details).to_csv(OUT / "region_selected_chemical_effects.csv", index=False)
 pd.DataFrame(cumulative).to_csv(OUT / "region_cumulative_effects.csv", index=False)
+regional = pd.DataFrame(five_test_outcomes)
+overall = regional.drop(columns="region").groupby("strategy", sort=False, as_index=False).sum()
+overall.insert(0, "region", "All")
+pd.concat([overall, regional], ignore_index=True).to_csv(OUT / "us_five_test_outcomes.csv", index=False)
+pd.DataFrame(sequential_tests).to_csv(OUT / "us_sequential_tests.csv", index=False)
 
 summary = []
 for region in regions + ["All"]:
